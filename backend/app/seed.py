@@ -19,7 +19,11 @@ CREATE TABLE IF NOT EXISTS batches (
   title TEXT NOT NULL,
   owner_shift_id INTEGER REFERENCES shifts(id),
   status TEXT NOT NULL DEFAULT '在途',
-  note TEXT NOT NULL DEFAULT ''
+  note TEXT NOT NULL DEFAULT '',
+  check_due_at TEXT,
+  overdue_hours INTEGER NOT NULL DEFAULT 0,
+  frozen_at TEXT,
+  freeze_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS handovers (
   id INTEGER PRIMARY KEY,
@@ -27,13 +31,24 @@ CREATE TABLE IF NOT EXISTS handovers (
   to_shift_id INTEGER NOT NULL REFERENCES shifts(id),
   status TEXT NOT NULL,
   batch_count INTEGER NOT NULL DEFAULT 0,
+  excluded_count INTEGER NOT NULL DEFAULT 0,
   reason TEXT NOT NULL DEFAULT '',
   started_at TEXT NOT NULL,
+  snapshot_at TEXT,
   finished_at TEXT
 );
 CREATE TABLE IF NOT EXISTS handover_items (
   handover_id INTEGER NOT NULL REFERENCES handovers(id),
   batch_id INTEGER NOT NULL REFERENCES batches(id),
+  PRIMARY KEY (handover_id, batch_id)
+);
+CREATE TABLE IF NOT EXISTS handover_start_keys (
+  handover_id INTEGER NOT NULL REFERENCES handovers(id),
+  batch_id INTEGER NOT NULL REFERENCES batches(id),
+  biz_key TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('纳入', '排除')),
+  reason TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (handover_id, batch_id)
 );
 CREATE TABLE IF NOT EXISTS reconcile_reports (
@@ -48,12 +63,38 @@ CREATE TABLE IF NOT EXISTS reconcile_reports (
 );
 """
 
+# 旧库补列：仅新增，不改历史语义
+_MIGRATIONS = {
+    "batches": {
+        "check_due_at": "TEXT",
+        "overdue_hours": "INTEGER NOT NULL DEFAULT 0",
+        "frozen_at": "TEXT",
+        "freeze_reason": "TEXT NOT NULL DEFAULT ''",
+    },
+    "handovers": {
+        "excluded_count": "INTEGER NOT NULL DEFAULT 0",
+        "snapshot_at": "TEXT",
+    },
+}
+
+
+def _ensure_columns(conn) -> None:
+    for table, columns in _MIGRATIONS.items():
+        existing = {
+            r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
 
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _ensure_columns(conn)
         n = conn.execute("SELECT COUNT(*) AS c FROM shifts").fetchone()["c"]
         if n:
+            conn.commit()
             return
         seed_path = FIXTURES_DIR / "seed.json"
         data = json.loads(Path(seed_path).read_text(encoding="utf-8"))
@@ -64,7 +105,12 @@ def init_db() -> None:
             )
         for b in data["batches"]:
             conn.execute(
-                "INSERT INTO batches(id, biz_key, title, owner_shift_id, status, note) VALUES (?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO batches(
+                  id, biz_key, title, owner_shift_id, status, note,
+                  check_due_at, overdue_hours
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     b["id"],
                     b["biz_key"],
@@ -72,6 +118,8 @@ def init_db() -> None:
                     b["owner_shift_id"],
                     b["status"],
                     b.get("note", ""),
+                    b.get("check_due_at"),
+                    b.get("overdue_hours", 0),
                 ),
             )
         conn.commit()
